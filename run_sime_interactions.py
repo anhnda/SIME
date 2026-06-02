@@ -7,7 +7,7 @@ USAGE
 Outputs:
   - <out>.html                 self-contained 4-tab interactive viewer
                                (first order | density | interactive graph | ranked pairs)
-  - hime_interactions.png      static quick-look (input | first-order | density | top edges)
+  - sime_interactions.png      static quick-look (input | first-order | density | top edges)
 
 The class index is left at None so the explainer uses the model's own top-1.
 HTML is self-contained: open in any browser, no server needed.
@@ -67,7 +67,7 @@ def _static_panel(res, img01, out_png):
                    lw=0.5 + 3.0 * abs(s) / dmax, alpha=0.5 + 0.4 * e["stab"])
     ax[3].set_title("top interaction pairs"); ax[3].axis("off")
 
-    title = (f"hime  |  class={res.target_class} ({res.target_class_name})  "
+    title = (f"sime  |  class={res.target_class} ({res.target_class_name})  "
              f"f_x={res.f_x:.3f}  |  {payload['meta']['n_edges']} pairs  "
              f"N={payload['meta']['n_samples']}")
     fig.suptitle(title)
@@ -80,7 +80,7 @@ def _static_panel(res, img01, out_png):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image")
-    ap.add_argument("--out", default="hime_tree.html",
+    ap.add_argument("--out", default="sime_tree.html",
                     help="path for the interactive HTML")
     ap.add_argument("--sigma", type=float, default=11.0)
     ap.add_argument("--grid", type=int, nargs=2, default=(12, 12),
@@ -89,7 +89,7 @@ def main():
                     help="number of mask queries (theory: N ~ C*s*log p / gamma^2)")
     ap.add_argument("--target", type=int, default=None,
                     help="class index; default = model top-1")
-    ap.add_argument("--static-png", default="hime_interactions.png")
+    ap.add_argument("--static-png", default="sime_interactions.png")
     ap.add_argument("--max-active-cells", type=int, default=40)
     ap.add_argument("--stability-runs", type=int, default=20)
     ap.add_argument("--stability-thresh", type=float, default=0.8)
