@@ -32,8 +32,8 @@ def make_k1_function(d, n_active, beta_active, m_resid, seed):
             out *= (2.0 * (Z[:, i] - 0.5))
         return out
 
-    def sample_fn(N, sigma_obs):
-        Z = (RNG.random((N, d)) > 0.5).astype(float)
+    def sample_fn(N, sigma_obs, _rng=np.random.default_rng(seed + 10_000)):
+        Z = (_rng.random((N, d)) > 0.5).astype(float)
         y = np.zeros(N)
         for i in range(d):
             if beta_true[i] != 0.0:
@@ -41,7 +41,7 @@ def make_k1_function(d, n_active, beta_active, m_resid, seed):
         for S, b in beta_hi.items():
             y += b * chi(Z, S)
         if sigma_obs > 0:
-            y += sigma_obs * RNG.standard_normal(N)
+            y += sigma_obs * _rng.standard_normal(N)
         return Z, y
 
     return beta_true, set(active), sample_fn
@@ -130,10 +130,9 @@ def verify_budget(d=30, n_active=4, sigma_obs=1.0, n_trials=30,
     log_pK = math.log(p_K(d, K))
     gammas = [2.00, 1.00, 0.71, 0.50]
     N_grid = np.unique(np.round(
-        np.geomspace(40, 4000, 26)).astype(int))
-    crit = (f"|beta_hat| > {rec_frac}*lam" if mag_tol is None
-            else f"|beta_hat| > {mag_tol:g}")
-    print(f"  recovery criterion            : {crit}")
+        np.geomspace(8, 4000, 34)).astype(int))
+    print(f"  recovery criterion            : "
+          f"all actives correct sign AND min|beta_hat_S| > {rec_frac}*lam")
     print(f"  {'gamma':>6} {'beta':>8} {'N@90%(emp)':>12} "
           f"{'pred N (C=2)':>13} {'implied C':>10}")
     results = []
@@ -151,8 +150,15 @@ def verify_budget(d=30, n_active=4, sigma_obs=1.0, n_trials=30,
                 Z, y = sf(N, sigma_obs)
                 X = centered_design(Z)
                 beta_hat, _ = lasso_fit(X, y, lam=max(lam, 1e-9))
-                rec = set(np.where(np.abs(beta_hat) > tol)[0].tolist())
-                if rec == active:
+                idx = sorted(active)
+                # signed DETECTION: every active separated from zero past the
+                # threshold with the correct sign (Corollary 2 floor claim).
+                # Silent on inactive coords -- FP control is Appendix E / incoh.
+                detected = all(
+                    np.sign(beta_hat[i]) == np.sign(beta_true[i])
+                    and abs(beta_hat[i]) > tol
+                    for i in idx)
+                if detected:
                     succ += 1
             if succ / n_trials >= 0.90:
                 emp_N = int(N)
