@@ -33,7 +33,12 @@ No torch is run automatically. Execute yourself:
 
     python verify_5_2_a.py --image /path/to/img.jpg
     python verify_5_2_a.py --image img.jpg --grid 12 12 --sigma 11 \
-                           --N-grid 200 400 800 1600 3200 6400 --device cuda
+                           --N-grid 1000 1500 2200 3200 4600 6400 --device cuda
+
+Note: start the N-grid ABOVE the feasibility floor N >~ s*log p_K (Cor.3).
+Budgets below it (e.g. 200, 400 for a ~80-cell support) are underdetermined --
+their Lasso support is near-arbitrary and will produce spurious "genuine drops"
+that are an artifact of the regime, not a violation of the monotonicity claim.
 """
 from __future__ import annotations
 
@@ -283,7 +288,22 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
           f"{eta_irr:.3f}")
     print(f"  irrepresentability (eta_irr < 1): "
           f"{'PASS' if incoh_ok else 'FAIL'} -- "
-          f"{'support recovery feasible' if incoh_ok else 'Appendix E precondition VIOLATED; non-monotone support is permitted, not a contradiction of (A)'}\n")
+          f"{'support recovery feasible' if incoh_ok else 'Appendix E precondition VIOLATED; non-monotone support is permitted, not a contradiction of (A)'}")
+
+    # feasibility floor (Corollary 3 / Appendix F): recovery is only POSSIBLE
+    # for N >~ s*log p_K, separate from the resolution floor. Budgets below this
+    # are underdetermined (fewer effective samples than active coeffs x log p),
+    # so their support is near-arbitrary and must not anchor the monotone check.
+    s_hat = max(len(S), 1)
+    N_feas = s_hat * math.log(p_K(d, K))
+    below = [N for N in grid if N < N_feas]
+    print(f"  feasibility floor N >~ s*log p_K = {N_feas:.0f}  "
+          f"(s_hat={s_hat})")
+    if below:
+        print(f"  WARNING: budgets {below} are BELOW the feasibility floor -- "
+              f"their fits are underdetermined and unreliable; drop them or "
+              f"raise --N-grid (recovery is not yet feasible there, Cor.3).")
+    print()
 
     # ---- Claim 1: floor non-increasing ----------------------------------- #
     floor_arr = np.array(floors)
@@ -433,7 +453,9 @@ def main():
     ap.add_argument("--sigma", type=float, default=11.0,
                     help="blur reference bandwidth")
     ap.add_argument("--N-grid", type=int, nargs="+",
-                    default=[200, 400, 800, 1600, 3200, 6400])
+                    default=[1000, 1500, 2200, 3200, 4600, 6400],
+                    help="budget grid; start above the feasibility floor "
+                         "N >~ s*log p_K (Cor.3), else fits are underdetermined")
     ap.add_argument("--K", type=int, default=1, choices=[1])
     ap.add_argument("--c-lambda", type=float, default=0.30,
                     help="penalty constant Clam")
