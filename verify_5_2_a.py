@@ -259,6 +259,32 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
     else:
         print()
 
+    # ---- incoherence diagnostic on the REALIZED design ------------------- #
+    # Claim (A) leans on Appendix E (exact support recovery), which requires the
+    # irrepresentability condition eta_irr < 1. The synthetic +-1 design had
+    # eta_irr ~ 0.09. A grid on a real image has spatially CORRELATED cells, so
+    # this can be violated -- in which case non-monotone support is allowed by
+    # the theory (the precondition fails), not a contradiction of the claim.
+    # We estimate eta_irr with the support = certified set at the largest budget.
+    S = sorted(int(i) for i in np.where(cert_indicator[-1])[0])
+    eta_irr = float("nan")
+    if 0 < len(S) < N_max:
+        Xf = centered_design(Z_full)
+        XS = Xf[:, S]
+        Sc = [j for j in range(d) if j not in S]
+        try:
+            G = XS.T @ XS
+            W = np.linalg.solve(G, XS.T @ Xf[:, Sc])    # (|S|, |Sc|)
+            eta_irr = float(np.max(np.sum(np.abs(W), axis=0)))
+        except np.linalg.LinAlgError:
+            eta_irr = float("inf")                       # singular Gram = degenerate
+    incoh_ok = eta_irr < 1.0
+    print(f"  incoherence eta_irr (support=C(N_max), |S|={len(S)}): "
+          f"{eta_irr:.3f}")
+    print(f"  irrepresentability (eta_irr < 1): "
+          f"{'PASS' if incoh_ok else 'FAIL'} -- "
+          f"{'support recovery feasible' if incoh_ok else 'Appendix E precondition VIOLATED; non-monotone support is permitted, not a contradiction of (A)'}\n")
+
     # ---- Claim 1: floor non-increasing ----------------------------------- #
     floor_arr = np.array(floors)
     floor_mono = bool(np.all(np.diff(floor_arr) <= 1e-12))
@@ -368,6 +394,12 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
     print("=" * 76)
     status = "PASS" if overall else ("VACUOUS" if not non_vacuous else "CHECK")
     print(f"  OVERALL 5.2(A)                : {status}")
+    if status == "CHECK" and not incoh_ok:
+        print("  NOTE: eta_irr >= 1 on this design -- Appendix E support recovery")
+        print("        is NOT guaranteed here, so the non-monotone certified set")
+        print("        is CONSISTENT with the theory (failed precondition), not a")
+        print("        refutation of (A). Report eta_irr alongside the result, or")
+        print("        use a coarser grid / decorrelated cells to restore eta_irr<1.")
     print("=" * 76)
 
     if out:
@@ -378,7 +410,11 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
             "N_grid": grid, "floors": floor_arr.tolist(),
             "cert_count": [int(c.sum()) for c in cert_indicator],
             "floor_monotone": floor_mono, "set_monotone": set_mono,
-            "flicker_rate": flicker_rate, "sign_flips": sign_flips,
+            "n_genuine_drops": n_genuine_drops,
+            "n_borderline_drops": n_borderline_drops,
+            "genuine_flicker": genuine_flicker, "flicker_rate": flicker_rate,
+            "sign_flips": sign_flips, "eta_irr": eta_irr,
+            "incoherence_ok": bool(incoh_ok),
         }
         with open(os.path.join(out, "verify_5_2_a.json"), "w") as fh:
             json.dump(rec, fh, indent=2)
