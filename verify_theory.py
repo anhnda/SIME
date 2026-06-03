@@ -33,7 +33,12 @@ No torch is run automatically. Execute yourself:
 
     python verify_5_2_a.py --image /path/to/img.jpg
     python verify_5_2_a.py --image img.jpg --grid 12 12 --sigma 11 \
-                           --N-grid 200 400 800 1600 3200 6400 --device cuda
+                           --N-grid 1000 1500 2200 3200 4600 6400 --device cuda
+
+Note: start the N-grid ABOVE the feasibility floor N >~ s*log p_K (Cor.3).
+Budgets below it (e.g. 200, 400 for a ~80-cell support) are underdetermined --
+their Lasso support is near-arbitrary and will produce spurious "genuine drops"
+that are an artifact of the regime, not a violation of the monotonicity claim.
 """
 from __future__ import annotations
 
