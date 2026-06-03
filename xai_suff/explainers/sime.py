@@ -36,13 +36,15 @@ class SIMEExplainer(Explainer):
                  kernel_width=0.25, seed=0, batch_size=64,
                  screen_quantile=0.6, max_active_cells=40,
                  stability_runs=20, stability_thresh=0.6,
-                 lasso_lambda_scale=0.3, **kw):
+                 lasso_C=2.0, leak_c=1.0, **kw):
         """
-        screen_quantile   : keep cells whose |main effect| is above this quantile.
-        max_active_cells  : hard cap m' on screened cells (controls p = m'+C(m',2)).
-        stability_runs     : bootstrap resamples for stability selection.
-        stability_thresh   : keep a pair if selected in >= this fraction of runs.
-        lasso_lambda_scale : multiplier on lambda ~ sigma*sqrt(2 log p / N).
+        lasso_C  : constant C in lambda = C (sigma + c sqrt(m)) sqrt(log p / N).
+                   Paper's verified support-recovery transition is C in [2,3]; 2.0
+                   is the conservative recoverable point. (Replaces the old
+                   lasso_lambda_scale=0.3, which sat ~10x below the validated floor.)
+        leak_c   : constant c on the reference-leakage term sqrt(m_hat). c=1 uses the
+                   held-out residual energy directly; raise to be more conservative
+                   against off-manifold references.
         """
         super().__init__(*args, **kw)
         self.grid = grid
@@ -55,7 +57,8 @@ class SIMEExplainer(Explainer):
         self.max_active_cells = max_active_cells
         self.stability_runs = stability_runs
         self.stability_thresh = stability_thresh
-        self.lasso_lambda_scale = lasso_lambda_scale
+        self.lasso_C = lasso_C
+        self.leak_c = leak_c
 
     # ---- identical cell map to LIME ----
     def _cell_id_map(self, H, W):
@@ -100,19 +103,16 @@ class SIMEExplainer(Explainer):
         weights = np.exp(-(d ** 2) / (self.kernel_width ** 2))
 
         # ---------- STAGE 1: screen main effects ----------
-        # cheap weighted-ridge main-effect fit -> rank cells.
         main_coefs = _weighted_ridge(Znp, probs, weights, alpha=1.0)
         mag = np.abs(main_coefs)
         thr = np.quantile(mag, self.screen_quantile)
         active = np.where(mag >= thr)[0]
-        # cap to max_active_cells by magnitude (controls candidate dimension p)
         if active.size > self.max_active_cells:
             active = active[np.argsort(mag[active])[::-1][:self.max_active_cells]]
         active = np.sort(active)
         pair_list = list(combinations(active.tolist(), 2))
 
         # ---------- STAGE 2: LASSO support recovery + stability selection ----------
-        # design over [active mains | candidate pairs]; center to absorb intercept.
         Zc = (Znp - 0.5)                       # +/-0.5 coding, zero-mean features
         main_block = Zc[:, active]             # (N, m')
         pair_block = np.empty((self.n_samples, len(pair_list)))
@@ -124,7 +124,15 @@ class SIMEExplainer(Explainer):
         y = probs - probs.mean()
 
         sigma_hat = max(np.std(y), 1e-6)
-        lam = self.lasso_lambda_scale * sigma_hat * np.sqrt(2 * np.log(p_dim) / self.n_samples)
+
+        # --- Reference-SNR penalty (Theorem 1): lambda = C (sigma + c sqrt(m)) sqrt(log p / N)
+        #     m_hat = held-out higher-order residual energy (Algorithm 1 proxy),
+        #     which is the reference-induced misspecification term. Estimated WITHOUT
+        #     recovering any degree->2 coefficient: it is just the unexplained variance
+        #     of the degree-2 fit on a fresh split.
+        m_hat = self._residual_energy_proxy(X, y, sigma_hat)
+        lam = (self.lasso_C * (sigma_hat + self.leak_c * np.sqrt(m_hat))
+               * np.sqrt(np.log(p_dim) / self.n_samples))
 
         def _stability(lmbda):
             rng = np.random.default_rng(self.seed)
@@ -140,26 +148,30 @@ class SIMEExplainer(Explainer):
         selected = stab >= self.stability_thresh
         n_pairs = int(np.sum(selected[m_act:]))
 
-        # auto-relax: if signal is weak and nothing survived, step lambda down
-        # rather than silently returning an empty (blank) explanation.
-        tries = 0
-        while n_pairs == 0 and tries < 3:
-            lam *= 0.3
-            stab = _stability(lam)
-            selected = stab >= self.stability_thresh
-            n_pairs = int(np.sum(selected[m_act:]))
-            tries += 1
+        # NO auto-relax. If nothing clears the floor, that is the floor reporting
+        # the truth (interactions below it are not guaranteed recoverable -- raise N
+        # or choose a lower-m reference). Relaxing lambda voids the recovery guarantee.
 
-        # full single-fit selection count, for the diagnostic
+        # single-fit count + below-threshold candidates, reported as DIAGNOSTICS only.
         full = LassoLars(alpha=lam, fit_intercept=True, max_iter=4000).fit(X, y)
         n_full = int(np.sum(np.abs(full.coef_[m_act:]) > 0))
-        print(f"[hime] sigma(y)={sigma_hat:.4f} lam={lam:.5f} "
-              f"single-fit pairs={n_full} stable pairs={n_pairs}"
-              f"{' (relaxed x%d)' % tries if tries else ''}")
+        # candidates that the single fit picks but stability does NOT confirm:
+        below = []
+        for gi in range(m_act, p_dim):
+            if full.coef_[gi] != 0.0 and not selected[gi]:
+                ci, cj = pair_list[gi - m_act]
+                below.append((int(ci), int(cj), float(full.coef_[gi]), float(stab[gi])))
+        below.sort(key=lambda t: -abs(t[2]))
+
+        floor = lam  # detection floor ~ lambda, for reporting
+        print(f"[sime] sigma(y)={sigma_hat:.4f} m_hat={m_hat:.5f} "
+              f"leak_frac={self.leak_c*np.sqrt(m_hat)/(sigma_hat+1e-12):.2f} "
+              f"lam={lam:.5f} single-fit pairs={n_full} stable pairs={n_pairs}")
         if n_pairs == 0:
-            print("[hime] WARNING: no interaction pairs survived. Signal may be "
-                  "below the detection floor -- try lower lasso_lambda_scale, "
-                  "lower stability_thresh, larger n_samples, or smaller sigma.")
+            print("[sime] no interaction pairs cleared the floor. This is a valid "
+                  "result: at this N and reference, no pair beats lambda="
+                  f"{lam:.5f}. Raise n_samples or use a lower-m reference (blur/"
+                  "inpaint) to lower the floor. (Did NOT relax lambda.)")
 
         # ---------- STAGE 3: re-solve on selected support ----------
         sel_idx = np.where(selected)[0]
@@ -169,19 +181,17 @@ class SIMEExplainer(Explainer):
         else:
             beta = np.zeros(0)
 
-        # split recovered coefficients back into mains and pairs
         main_effect = np.zeros(n_cells)
         interactions = []
         for k, gi in enumerate(sel_idx):
             coef = beta[k]
-            if gi < m_act:                       # main effect column
+            if gi < m_act:
                 main_effect[active[gi]] = coef
-            else:                                # pair column
+            else:
                 ci, cj = pair_list[gi - m_act]
                 interactions.append((int(ci), int(cj), float(coef)))
         interactions.sort(key=lambda t: -abs(t[2]))
 
-        # paint first-order map (blocky, like LIME)
         coef_t = torch.tensor(main_effect, dtype=torch.float32, device=self.device)
         attr = coef_t[cell_ids].cpu().numpy()
 
@@ -198,13 +208,41 @@ class SIMEExplainer(Explainer):
                 "candidate_pairs": len(pair_list),
                 "candidate_dim_p": int(p_dim),
                 "lambda": float(lam),
-                "interactions": interactions,          # (cell_i, cell_j, strength)
+                "sigma_hat": float(sigma_hat),
+                "m_hat": float(m_hat),                 # reference residual energy
+                "detection_floor": float(floor),
+                "interactions": interactions,          # (cell_i, cell_j, strength) -- recovered
+                "below_floor": below,                  # diagnostics: single-fit, NOT stability-confirmed
                 "interaction_stability": {
                     f"{pair_list[gi - m_act][0]}-{pair_list[gi - m_act][1]}": float(stab[gi])
                     for gi in sel_idx if gi >= m_act
                 },
             },
         )
+
+    # ------------------------------------------------------------------ #
+    # Algorithm 1 held-out residual-energy proxy for m_{>2,rho}.
+    # m_hat = E_val[(y - g_hat_{<=2})^2] - sigma^2, clipped at 0.
+    # Estimates higher-order residual energy WITHOUT recovering any
+    # higher-order coefficient -- it is unexplained variance of the
+    # degree-2 fit measured on a fresh split. Upward bias (finite-sample
+    # error in g_hat) is the conservative direction for a detection floor.
+    # ------------------------------------------------------------------ #
+    def _residual_energy_proxy(self, X, y, sigma_hat):
+        n = X.shape[0]
+        rng = np.random.default_rng(self.seed + 1)
+        perm = rng.permutation(n)
+        n_tr = n // 2
+        tr, va = perm[:n_tr], perm[n_tr:]
+        # ridge fit of the degree-2 surrogate on train (light reg for conditioning)
+        Xtr = np.concatenate([X[tr], np.ones((tr.size, 1))], axis=1)
+        A = Xtr.T @ Xtr + 1e-3 * np.eye(Xtr.shape[1])
+        A[-1, -1] = 0.0
+        coef = np.linalg.solve(A, Xtr.T @ y[tr])
+        Xva = np.concatenate([X[va], np.ones((va.size, 1))], axis=1)
+        resid = y[va] - Xva @ coef
+        m_hat = float(np.mean(resid ** 2) - sigma_hat ** 2)
+        return max(m_hat, 0.0)
 
 
 def _weighted_ridge(Z, y, w, alpha=1.0):
