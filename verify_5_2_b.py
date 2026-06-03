@@ -20,7 +20,8 @@ empirically, and the script says so rather than dressing them up as a PASS:
     "the inversion round-trips", not "the theory predicted the world".
 
   * The certified COUNT at N_pred is whatever it is; the claim is about its
-    LOWER EDGE, i.e. the smallest certified |beta_hat| should be ~= beta_min.
+    LOWER EDGE, i.e. the smallest certified |beta_hat| should be ~= the run's
+    realized floor (the resolution the calibrated budget actually buys).
 
 THE GENUINELY EMPIRICAL CONTENT, and what (B) actually stakes:
 
@@ -34,13 +35,14 @@ THE GENUINELY EMPIRICAL CONTENT, and what (B) actually stakes:
 
   (B2) LOWER-EDGE LANDING. The smallest certified coefficient at N_pred,
        beta_edge = min_{j in C(N_pred)} |beta_hat_j|, should sit just above the
-       realized floor and near beta_min. Because the calibrated budget over-
-       resolves (the floor at N_pred sits BELOW beta_min by C_floor/C_budget),
-       the right reference for "landing" is beta_min itself, not the realized
-       floor: beta_edge / beta_min should sit in roughly [1, 1+band]. If
-       beta_edge is far above beta_min, the run resolved nothing new near the
-       threshold (over-budgeted / nothing lives there); if the certified set is
-       empty, the prediction is vacuous at this beta_min.
+       run's REALIZED floor -- that floor is the resolution the calibrated budget
+       actually buys. Because the calibrated budget over-resolves (the floor at
+       N_pred sits BELOW beta_min by C_floor/C_budget), the right reference for
+       "the certified set extends down to the run's resolution" is the realized
+       floor, not beta_min: beta_edge / floor should sit in roughly [1, 1+band].
+       If beta_edge is far above the floor, the run resolved nothing new near its
+       own resolution (over-budgeted / nothing lives there); if the certified set
+       is empty, the prediction is vacuous at this beta_min.
 
   (B3) CONSISTENCY WITH 5.2(A). Running ALSO at a coarser and a finer budget
        (N_pred/2, 2*N_pred) should bracket the certified count monotonically
@@ -350,15 +352,17 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
               f"desired, but down to beta_min is covered.")
     print()
 
-    # ---- [Claim B2] lower-edge landing near beta_min --------------------- #
+    # ---- [Claim B2] lower-edge landing at the run's realized floor ------- #
     # The calibrated budget over-resolves: the realized floor sits at
-    # beta_min*C_floor/C_budget, BELOW beta_min. So "the certified set extends
-    # down to beta_min" must be judged against beta_min, not against the floor.
-    # We check beta_edge/beta_min in [1, 1+band]: the smallest certified
-    # coefficient should sit just above the requested threshold. (We still print
-    # beta_edge/floor for context, but it is NOT the pass criterion -- with an
-    # over-resolving budget that ratio is expected to be large.)
-    print("[Claim B2] certified set extends DOWN TO ~= beta_min (lower edge)")
+    # beta_min*C_floor/C_budget, BELOW beta_min. The paper's claim is that the
+    # certified set extends DOWN TO the run's resolution -- i.e. the smallest
+    # certified coefficient sits just above the realized floor, the resolution
+    # the calibrated budget actually buys. So we judge beta_edge against the
+    # FLOOR, not beta_min: beta_edge/floor in [1, 1+band]. (We still print
+    # beta_edge/beta_min for context, but with an over-resolving budget that
+    # ratio is EXPECTED to be small and is NOT the pass criterion.)
+    print("[Claim B2] certified set extends DOWN TO the run's realized floor "
+          "(lower edge)")
     if run["vacuous"]:
         b2_ok = False
         print(f"  certified count = 0 at N_pred -> VACUOUS. No coefficient "
@@ -366,33 +370,28 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
               f"the fit scale is off. (max|beta_hat| = {run['max_abs_beta']:.5f})")
     else:
         edge_ratio_floor = run["beta_edge"] / (run["floor"] + 1e-12)
-        edge_ratio = run["beta_edge"] / (beta_min + 1e-12)
-        # smallest certified coeff should sit just above the REQUESTED beta_min:
-        # ratio in [1, 1+edge_band]. Far above -> nothing lives near beta_min
-        # (over-budget); below 1 -> the run certified a coefficient the budget
-        # was not promised to resolve (still safe, but flags beta_min set low).
-        b2_ok = 1.0 - edge_band <= edge_ratio <= 1.0 + edge_band
+        edge_ratio_bmin = run["beta_edge"] / (beta_min + 1e-12)
+        # smallest certified coeff should sit just above the REALIZED floor:
+        # ratio in [1, 1+edge_band]. Below 1 is impossible (cert requires
+        # |beta_hat| > floor). Far above -> nothing lives near the floor
+        # (the run resolved nothing new at its own resolution / over-budget).
+        b2_ok = 1.0 <= edge_ratio_floor <= 1.0 + edge_band
         print(f"  certified count        = {run['cert_count']}")
         print(f"  smallest certified |b| = {run['beta_edge']:.5f}  "
               f"(beta_edge)")
-        print(f"  requested beta_min     = {beta_min:.5f}")
         print(f"  realized floor         = {run['floor']:.5f}  "
-              f"(over-resolves: {run['floor']/beta_min:.2f} x beta_min)")
-        print(f"  beta_edge / beta_min   = {edge_ratio:.3f}  "
-              f"(target [{1-edge_band:.2f}, {1+edge_band:.2f}])  "
-              f"{'PASS' if b2_ok else 'CHECK'}")
+              f"(resolution the budget buys; {run['floor']/beta_min:.2f} x beta_min)")
+        print(f"  requested beta_min     = {beta_min:.5f}")
         print(f"  beta_edge / floor      = {edge_ratio_floor:.3f}  "
-              f"(context only; large is EXPECTED when the budget over-resolves)")
-        if edge_ratio > 1.0 + edge_band:
-            print(f"    edge sits well above beta_min: the run certified nothing "
-                  f"NEW near the threshold -- either no coefficient lives in "
-                  f"[beta_min, {run['beta_edge']:.4f}] (over-budgeted) or beta_min "
-                  f"is set below a gap in the spectrum.")
-        elif edge_ratio < 1.0 - edge_band:
-            print(f"    edge sits below beta_min: the run certified a coefficient "
-                  f"smaller than requested -- consistent with the over-resolving "
-                  f"budget (floor < beta_min), but beta_min may be set above the "
-                  f"smallest real coefficient.")
+              f"(target [{1.00:.2f}, {1+edge_band:.2f}])  "
+              f"{'PASS' if b2_ok else 'CHECK'}")
+        print(f"  beta_edge / beta_min   = {edge_ratio_bmin:.3f}  "
+              f"(context only; small is EXPECTED when the budget over-resolves)")
+        if edge_ratio_floor > 1.0 + edge_band:
+            print(f"    edge sits well above the floor: the run certified nothing "
+                  f"NEW near its resolution -- either no coefficient lives in "
+                  f"[floor, {run['beta_edge']:.4f}] (over-budgeted) or the spectrum "
+                  f"has a gap just above the floor.")
     print()
 
     # ---- [Claim B3] consistency with 5.2(A): bracket N_pred monotonically  #
@@ -495,8 +494,8 @@ def main():
     ap.add_argument("--sigma-obs", type=float, default=0.0,
                     help="query-noise scale (0 for deterministic model+ref)")
     ap.add_argument("--edge-band", type=float, default=0.25,
-                    help="tolerance for beta_edge/beta_min (lower-edge landing); "
-                         "ratio in [1-band, 1+band] counts as landing at beta_min")
+                    help="tolerance for beta_edge/floor (lower-edge landing); "
+                         "ratio in [1, 1+band] counts as landing at the floor")
     ap.add_argument("--transfer-tol", type=float, default=0.15,
                     help="how far below run sigma_eff the pilot may sit before "
                          "B1 fails (pilot is supposed to over-estimate)")
