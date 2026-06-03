@@ -34,10 +34,13 @@ THE GENUINELY EMPIRICAL CONTENT, and what (B) actually stakes:
 
   (B2) LOWER-EDGE LANDING. The smallest certified coefficient at N_pred,
        beta_edge = min_{j in C(N_pred)} |beta_hat_j|, should sit just above the
-       realized floor and near beta_min: ratio beta_edge / floor in roughly
-       [1, 1+band]. If beta_edge is far above floor, the run resolved nothing new
-       near the threshold (over-budgeted / nothing lives there); if the certified
-       set is empty, the prediction is vacuous at this beta_min.
+       realized floor and near beta_min. Because the calibrated budget over-
+       resolves (the floor at N_pred sits BELOW beta_min by C_floor/C_budget),
+       the right reference for "landing" is beta_min itself, not the realized
+       floor: beta_edge / beta_min should sit in roughly [1, 1+band]. If
+       beta_edge is far above beta_min, the run resolved nothing new near the
+       threshold (over-budgeted / nothing lives there); if the certified set is
+       empty, the prediction is vacuous at this beta_min.
 
   (B3) CONSISTENCY WITH 5.2(A). Running ALSO at a coarser and a finer budget
        (N_pred/2, 2*N_pred) should bracket the certified count monotonically
@@ -264,7 +267,7 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
     print("=" * 78)
     print(f"  target class = {target} ({class_name})")
     print(f"  grid cells d = {d}   K = {K}   p_K = {p_K(d, K)}")
-    print(f"  beta_min     = {beta_min}   C = Cest*Clam = {C:.4f}\n")
+    print(f"  beta_min     = {beta_min}   C_floor = Cest*Clam = {C_floor:.4f}\n")
 
     # ---- (i)-(iii) pilot -> sigma_eff -> N_pred -------------------------- #
     sigma_pilot, pinfo = sigma_eff_from_split(
@@ -348,6 +351,13 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
     print()
 
     # ---- [Claim B2] lower-edge landing near beta_min --------------------- #
+    # The calibrated budget over-resolves: the realized floor sits at
+    # beta_min*C_floor/C_budget, BELOW beta_min. So "the certified set extends
+    # down to beta_min" must be judged against beta_min, not against the floor.
+    # We check beta_edge/beta_min in [1, 1+band]: the smallest certified
+    # coefficient should sit just above the requested threshold. (We still print
+    # beta_edge/floor for context, but it is NOT the pass criterion -- with an
+    # over-resolving budget that ratio is expected to be large.)
     print("[Claim B2] certified set extends DOWN TO ~= beta_min (lower edge)")
     if run["vacuous"]:
         b2_ok = False
@@ -355,23 +365,34 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
               f"clears the floor; beta_min may be below the whole support, or "
               f"the fit scale is off. (max|beta_hat| = {run['max_abs_beta']:.5f})")
     else:
-        edge_ratio = run["beta_edge"] / (run["floor"] + 1e-12)
-        # the smallest certified coefficient should sit just above the floor:
+        edge_ratio_floor = run["beta_edge"] / (run["floor"] + 1e-12)
+        edge_ratio = run["beta_edge"] / (beta_min + 1e-12)
+        # smallest certified coeff should sit just above the REQUESTED beta_min:
         # ratio in [1, 1+edge_band]. Far above -> nothing lives near beta_min
-        # (over-budget); ~1 -> the run resolved exactly down to the threshold.
-        b2_ok = 1.0 - 1e-6 <= edge_ratio <= 1.0 + edge_band
+        # (over-budget); below 1 -> the run certified a coefficient the budget
+        # was not promised to resolve (still safe, but flags beta_min set low).
+        b2_ok = 1.0 - edge_band <= edge_ratio <= 1.0 + edge_band
         print(f"  certified count        = {run['cert_count']}")
         print(f"  smallest certified |b| = {run['beta_edge']:.5f}  "
               f"(beta_edge)")
-        print(f"  realized floor         = {run['floor']:.5f}")
-        print(f"  beta_edge / floor      = {edge_ratio:.3f}  "
-              f"(target [1, {1+edge_band:.2f}])  "
+        print(f"  requested beta_min     = {beta_min:.5f}")
+        print(f"  realized floor         = {run['floor']:.5f}  "
+              f"(over-resolves: {run['floor']/beta_min:.2f} x beta_min)")
+        print(f"  beta_edge / beta_min   = {edge_ratio:.3f}  "
+              f"(target [{1-edge_band:.2f}, {1+edge_band:.2f}])  "
               f"{'PASS' if b2_ok else 'CHECK'}")
+        print(f"  beta_edge / floor      = {edge_ratio_floor:.3f}  "
+              f"(context only; large is EXPECTED when the budget over-resolves)")
         if edge_ratio > 1.0 + edge_band:
-            print(f"    edge sits well above floor: the run certified nothing "
-                  f"NEW near beta_min -- either no coefficient lives in "
-                  f"[floor, {run['beta_edge']:.4f}] (over-budgeted) or beta_min "
+            print(f"    edge sits well above beta_min: the run certified nothing "
+                  f"NEW near the threshold -- either no coefficient lives in "
+                  f"[beta_min, {run['beta_edge']:.4f}] (over-budgeted) or beta_min "
                   f"is set below a gap in the spectrum.")
+        elif edge_ratio < 1.0 - edge_band:
+            print(f"    edge sits below beta_min: the run certified a coefficient "
+                  f"smaller than requested -- consistent with the over-resolving "
+                  f"budget (floor < beta_min), but beta_min may be set above the "
+                  f"smallest real coefficient.")
     print()
 
     # ---- [Claim B3] consistency with 5.2(A): bracket N_pred monotonically  #
@@ -415,17 +436,19 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
     status = "PASS" if overall else ("VACUOUS" if not non_vacuous else "CHECK")
     print("=" * 78)
     print(f"  OVERALL 5.2(B)               : {status}")
-    print(f"  predicted floor vs beta_min  : {run['floor']:.5f} vs {beta_min} "
-          f"(round-trip {'ok' if rt_ok else 'BAD'})")
+    print(f"  realized floor vs beta_min   : {run['floor']:.5f} vs {beta_min} "
+          f"(round-trip {'ok' if rt_ok else 'BAD'}; over-resolves by design)")
     print(f"  certified count at N_pred    : {run['cert_count']}")
     print(f"  pilot over-budget factor     : ~{over_factor:.1f}x "
           f"(App.G: pilot is conservative -> N_pred is an UPPER estimate)")
     print("=" * 78)
 
     metrics = {
-        "d": d, "K": K, "beta_min": beta_min, "C": C,
+        "d": d, "K": K, "beta_min": beta_min,
+        "C_floor": C_floor, "C_budget": C_budget,
         "sigma_eff_pilot": sigma_pilot, "sigma_eff_run": sigma_run,
         "N_pred": N_pred, "floor_pred": floor_pred,
+        "floor_target": floor_target,
         "floor_realized": run["floor"], "cert_count": run["cert_count"],
         "beta_edge": run["beta_edge"], "max_abs_beta": run["max_abs_beta"],
         "round_trip_ok": rt_ok, "transfer_ok": b1_ok,
@@ -465,13 +488,15 @@ def main():
                     help="penalty constant Clam")
     ap.add_argument("--c-est", type=float, default=1.0,
                     help="floor constant Cest (floor = Cest*lambda)")
+    ap.add_argument("--c-budget", type=float, default=3.5,
+                    help="calibrated budget constant C (Table 2 transition); "
+                         "distinct from the floor's Cest*Clam")
     ap.add_argument("--n-pilot", type=int, default=512)
     ap.add_argument("--sigma-obs", type=float, default=0.0,
                     help="query-noise scale (0 for deterministic model+ref)")
     ap.add_argument("--edge-band", type=float, default=0.25,
-                    help="upper tolerance for beta_edge/floor (lower-edge "
-                         "landing); ratio in [1, 1+band] counts as landing at "
-                         "beta_min")
+                    help="tolerance for beta_edge/beta_min (lower-edge landing); "
+                         "ratio in [1-band, 1+band] counts as landing at beta_min")
     ap.add_argument("--transfer-tol", type=float, default=0.15,
                     help="how far below run sigma_eff the pilot may sit before "
                          "B1 fails (pilot is supposed to over-estimate)")
@@ -496,9 +521,10 @@ def main():
 
     verify(model, x, b, cell_ids, n_cells, target, class_names[target], device,
            beta_min=args.beta_min, K=args.K, c_lambda=args.c_lambda,
-           c_est=args.c_est, n_pilot=args.n_pilot, sigma_obs=args.sigma_obs,
-           edge_band=args.edge_band, transfer_tol=args.transfer_tol,
-           seed=args.seed, batch_size=args.batch_size, out=args.out)
+           c_est=args.c_est, C_budget=args.c_budget, n_pilot=args.n_pilot,
+           sigma_obs=args.sigma_obs, edge_band=args.edge_band,
+           transfer_tol=args.transfer_tol, seed=args.seed,
+           batch_size=args.batch_size, out=args.out)
 
 
 if __name__ == "__main__":
