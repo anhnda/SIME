@@ -422,30 +422,37 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
         print("        use a coarser grid / decorrelated cells to restore eta_irr<1.")
     print("=" * 76)
 
+    metrics = {
+        "d": d, "eta_irr": eta_irr, "incoherence_ok": bool(incoh_ok),
+        "n_genuine_drops": n_genuine_drops,
+        "n_borderline_drops": n_borderline_drops,
+        "genuine_flicker": genuine_flicker, "flicker_rate": flicker_rate,
+        "sign_flips": sign_flips, "n_entered": n_entered,
+        "cert_count_final": int(cert_indicator[-1].sum()),
+        "s_hat": s_hat, "overall": overall,
+    }
     if out:
         os.makedirs(out, exist_ok=True)
-        rec = {
-            "target": target, "class_name": class_name,
-            "d": d, "K": K, "sigma_eff": sigma_eff,
-            "N_grid": grid, "floors": floor_arr.tolist(),
+        rec = dict(metrics)
+        rec.update({
+            "target": target, "class_name": class_name, "K": K,
+            "sigma_eff": sigma_eff, "N_grid": grid,
+            "floors": floor_arr.tolist(),
             "cert_count": [int(c.sum()) for c in cert_indicator],
             "floor_monotone": floor_mono, "set_monotone": set_mono,
-            "n_genuine_drops": n_genuine_drops,
-            "n_borderline_drops": n_borderline_drops,
-            "genuine_flicker": genuine_flicker, "flicker_rate": flicker_rate,
-            "sign_flips": sign_flips, "eta_irr": eta_irr,
-            "incoherence_ok": bool(incoh_ok),
-        }
+        })
         with open(os.path.join(out, "verify_5_2_a.json"), "w") as fh:
             json.dump(rec, fh, indent=2)
         print(f"  -> {os.path.join(out, 'verify_5_2_a.json')}")
-    return overall
+    return metrics
 
 
 def main():
     ap = argparse.ArgumentParser(
         description="Verify Section 5.2(A): monotone recovery in N (image model).")
-    ap.add_argument("--image", required=True, help="path to input image")
+    ap.add_argument("--image", required=True, nargs="+",
+                    help="path(s) to input image(s); multiple only used in "
+                         "--grid-sweep mode")
     ap.add_argument("--target", type=int, default=None,
                     help="target class (default: model top-1)")
     ap.add_argument("--grid", type=int, nargs=2, default=(12, 12),
@@ -472,27 +479,92 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--device",
                     default="cuda" if torch.cuda.is_available() else "cpu")
+    # sweep mode: vary grid resolution to test whether eta_irr<1 is reachable
+    # and whether monotonicity returns once it is. Accepts multiple --image for
+    # cross-image aggregation. --grid-sweep "6 8 10 12 14" gives square grids.
+    ap.add_argument("--grid-sweep", type=int, nargs="+", default=None,
+                    metavar="G",
+                    help="if set, run square GxG grids for each G and tabulate "
+                         "eta_irr vs genuine-drop count (overrides --grid)")
     args = ap.parse_args()
 
     device = args.device
     model = load_backbone(device)
     class_names = get_class_names()
-    x = load_image(args.image, device)
-    _, _, H, W = x.shape
+    images = args.image if isinstance(args.image, list) else [args.image]
 
+    if args.grid_sweep:
+        run_sweep(args, model, class_names, device, images)
+        return
+
+    # ---- single run ------------------------------------------------------ #
+    x = load_image(images[0], device)
+    _, _, H, W = x.shape
     with torch.no_grad():
         top1 = int(model(x).argmax(1).item())
     target = args.target if args.target is not None else top1
-
     cell_ids = cell_id_map(H, W, tuple(args.grid)).to(device)
     n_cells = args.grid[0] * args.grid[1]
     b = blur_reference(x, args.sigma).to(device)
-
     verify(model, x, b, cell_ids, n_cells, target, class_names[target], device,
            N_grid=args.N_grid, K=args.K, c_lambda=args.c_lambda,
            c_est=args.c_est, n_pilot=args.n_pilot, sigma_obs=args.sigma_obs,
            cert_band=args.cert_band, seed=args.seed,
            batch_size=args.batch_size, out=args.out)
+
+
+def run_sweep(args, model, class_names, device, images):
+    """Sweep grid resolution (and images): does eta_irr fall below 1 as cells
+    coarsen, and do genuine drops collapse with it? This is the test that tells
+    whether 5.2(A)'s incoherence precondition is reachable in a sensible regime
+    (theory is predictive) or never holds for real LIME (claim is vacuous).
+    """
+    rows = []  # (img_name, G, d, eta_irr, incoh_ok, genuine_drops, flicker_rate)
+    for img_path in images:
+        x = load_image(img_path, device)
+        _, _, H, W = x.shape
+        with torch.no_grad():
+            top1 = int(model(x).argmax(1).item())
+        target = args.target if args.target is not None else top1
+        b = blur_reference(x, args.sigma).to(device)
+        name = os.path.basename(img_path)
+        for G in args.grid_sweep:
+            cell_ids = cell_id_map(H, W, (G, G)).to(device)
+            n_cells = G * G
+            print(f"\n##### image={name}  grid={G}x{G} (d={n_cells}) #####")
+            m = verify(model, x, b, cell_ids, n_cells, target,
+                       class_names[target], device, N_grid=args.N_grid,
+                       K=args.K, c_lambda=args.c_lambda, c_est=args.c_est,
+                       n_pilot=args.n_pilot, sigma_obs=args.sigma_obs,
+                       cert_band=args.cert_band, seed=args.seed,
+                       batch_size=args.batch_size, out=None)
+            rows.append((name, G, m["d"], m["eta_irr"], m["incoherence_ok"],
+                         m["n_genuine_drops"], m["flicker_rate"]))
+
+    # ---- summary table --------------------------------------------------- #
+    print("\n" + "=" * 76)
+    print("GRID SWEEP SUMMARY: does eta_irr<1 become reachable, and do genuine")
+    print("drops collapse with it? (the test of whether 5.2(A) is predictive)")
+    print("=" * 76)
+    print(f"  {'image':>16} {'GxG':>6} {'d':>5} {'eta_irr':>9} "
+          f"{'incoh<1':>8} {'genuine_drops':>14} {'flicker%':>9}")
+    for name, G, d, eta, ok, gd, fr in rows:
+        print(f"  {name[:16]:>16} {f'{G}x{G}':>6} {d:>5} {eta:>9.3f} "
+              f"{'yes' if ok else 'NO':>8} {gd:>14} {fr*100:>8.1f}%")
+
+    # per-image: coarsest grid where eta_irr<1, and its drop count
+    print("\n  reading: if drops fall toward 0 exactly where incoh flips to "
+          "'yes',\n  the theory is predictive (recommend that grid). If drops "
+          "persist\n  below eta_irr=1, the additive certificate needs the "
+          "correlated case\n  handled, not assumed -- a real limitation of 5.2(A).")
+    if args.out:
+        os.makedirs(args.out, exist_ok=True)
+        with open(os.path.join(args.out, "grid_sweep.json"), "w") as fh:
+            json.dump([{"image": n, "G": G, "d": d, "eta_irr": e,
+                        "incoherence_ok": ok, "genuine_drops": gd,
+                        "flicker_rate": fr}
+                       for n, G, d, e, ok, gd, fr in rows], fh, indent=2)
+        print(f"\n  -> {os.path.join(args.out, 'grid_sweep.json')}")
 
 
 if __name__ == "__main__":
