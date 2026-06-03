@@ -228,25 +228,40 @@ def _lasso_cd(X, y, lam, n_iter=20000, tol=1e-7):
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def admissibility_check(model, x, b, cell_ids, n_cells, target, device,
-                        y_pilot, var_thresh, ood_thresh, batch_size):
+                        y_pilot, Z_pilot, r2_thresh, ood_thresh, batch_size):
     """Return (passed: bool, info: dict) for reference field b.
 
-    (a) non-degenerate target-score variation: Var_z[g_rho(z)] over the pilot
-        masks must exceed var_thresh. A flattening reference makes g_rho ~ const,
-        so this variance collapses -- exactly the case Appendix I excludes.
+    (a) NON-DEGENERATE PER-CELL STRUCTURE (the operative Appendix I clause).
+        The wrong test is "variance of g_rho over masks is large": a FLAT fill
+        (mean/black/gray) produces a big, easy figure/ground swing -- the
+        response is essentially "how much real image is showing" = a function of
+        the global mask fraction alone -- so its variance is LARGE while it
+        carries no resolvable per-cell signal. That is exactly the degenerate
+        reference Appendix I excludes, and a variance gate REWARDS it.
+        The right test: regress g_rho(z) on the single scalar mean(z) (the global
+        on/off fraction). If R^2 is near 1, the response is explained by the
+        global shift alone -- no per-cell structure beyond figure/ground -> the
+        reference is degenerate for certification. We require R^2 < r2_thresh
+        (i.e. substantial variance REMAINS after removing the global-shift term).
     (b) in-range fill: the reference, in [0,1] pixel space, lies in [0,1].
     (c) OOD proxy: penultimate-feature distance between the all-off composite
-        (fully referenced image) and the original, normalized by the original's
-        feature norm, must not exceed ood_thresh. Catches references that throw
-        the masked input far off the data manifold.
+        and the original, normalized, must not exceed ood_thresh.
     """
     info = {}
 
-    # (a) non-degenerate variation, measured on the SAME pilot responses used
-    # to estimate sigma_eff (no extra queries).
-    score_var = float(np.var(y_pilot))
-    info["score_var"] = score_var
-    pass_var = score_var > var_thresh
+    # (a) global-shift R^2 on the pilot responses (no extra queries).
+    frac = Z_pilot.mean(axis=1)                       # mean(z) per mask, in [0,1]
+    fc = frac - frac.mean()
+    yc = y_pilot - y_pilot.mean()
+    denom_f = float(fc @ fc) + 1e-12
+    slope = float(fc @ yc) / denom_f                  # OLS of y on frac
+    pred = slope * fc
+    ss_res = float(np.sum((yc - pred) ** 2))
+    ss_tot = float(np.sum(yc ** 2)) + 1e-12
+    global_shift_r2 = 1.0 - ss_res / ss_tot
+    info["global_shift_r2"] = global_shift_r2
+    info["score_var"] = float(np.var(y_pilot))        # kept for reporting only
+    pass_struct = global_shift_r2 < r2_thresh
 
     # (b) in-range fill (check the pixel-space reference)
     b01 = denormalize(b)
@@ -267,10 +282,10 @@ def admissibility_check(model, x, b, cell_ids, n_cells, target, device,
     info["ood_dist"] = ood
     pass_ood = ood <= ood_thresh
 
-    info["pass_var"] = pass_var
+    info["pass_struct"] = pass_struct
     info["pass_range"] = pass_range
     info["pass_ood"] = pass_ood
-    passed = bool(pass_var and pass_range and pass_ood)
+    passed = bool(pass_struct and pass_range and pass_ood)
     return passed, info
 
 
@@ -307,15 +322,26 @@ def _features(model, x):
 
 
 # --------------------------------------------------------------------------- #
-# RE proxy on the realized standardized design (gamma diagnostic)
+# RE proxy -- reference-DEPENDENT. The restricted-eigenvalue constant of
+# Assumption 2 is a property of the design RESTRICTED TO THE ACTIVE SUPPORT,
+# and the active support is exactly where the reference enters (different refs
+# certify different cells). We proxy gamma by the minimum eigenvalue of the
+# standardized Gram on the certified columns S:  lambda_min( (1/N) X_S^T X_S ).
+# Different S -> different value, so flat vs on-manifold references now separate.
+# (The old whole-design Gram was identical across refs by construction -- a bug.)
 # --------------------------------------------------------------------------- #
-def re_proxy(Z):
-    """Minimum eigenvalue of the standardized Gram (1/N) X^T X on the centered
-    +-1 design. For an exactly balanced design this is ~1; values well below 1
-    signal correlated cells -> a smaller RE constant gamma for THIS reference.
-    Reported so the (sigma_eff)^2 ratio law can be read with the gamma caveat.
+def re_proxy_on_support(Z, S):
+    """lambda_min of the standardized Gram restricted to certified columns S.
+
+    Returns NaN if S is empty (nothing certified -> RE undefined here). With a
+    single certified column the Gram is 1x1 and the value is ~1 (a lone column
+    is trivially well-conditioned); the diagnostic only bites once |S| >= 2,
+    where spatially correlated certified cells drive lambda_min down.
     """
-    X = centered_design(Z)
+    S = list(S)
+    if len(S) == 0:
+        return float("nan")
+    X = centered_design(Z)[:, S]
     N = X.shape[0]
     G = (X.T @ X) / N
     try:
@@ -347,9 +373,14 @@ def measure_sigma_eff(model, x, b, cell_ids, n_cells, target, device,
     resid_var = float(np.mean((yv - pred) ** 2))
     m_hat = max(resid_var - sigma_obs ** 2, 0.0)
     sigma_eff = sigma_obs + math.sqrt(m_hat)
-    re = re_proxy(Zf)
+    # NOTE: the RE proxy is NOT computed here. The mask Gram is identical across
+    # references (same RNG, reference never touches the design matrix), so a
+    # design-only proxy is structurally constant and tells us nothing. The
+    # reference-dependent RE proxy is computed in run_reference_at_N on the
+    # certified active columns S, where the reference DOES enter (via which cells
+    # clear the floor). See re_proxy_on_support().
     return sigma_eff, {"resid_var": resid_var, "m_hat": m_hat, "b0": b0,
-                       "re_proxy": re, "y_pilot": yf}
+                       "y_pilot": yf, "Z_pilot": Zf}
 
 
 # --------------------------------------------------------------------------- #
@@ -370,10 +401,14 @@ def run_reference_at_N(model, x, b, cell_ids, n_cells, target, device,
     cert = np.abs(beta_hat) > fl
     cert_count = int(cert.sum())
     max_abs = float(np.max(np.abs(beta_hat)))
+    # reference-dependent RE proxy on the certified active columns
+    S = np.where(cert)[0]
+    re = re_proxy_on_support(Z, S)
     return {
         "floor_realized": fl, "cert_count": cert_count,
         "max_abs_beta": max_abs, "n_cleared": cert_count,
-        "vacuous": max_abs < fl,
+        "vacuous": max_abs < fl, "re_proxy": re,
+        "support_size": int(cert_count),
     }
 
 
@@ -382,7 +417,7 @@ def run_reference_at_N(model, x, b, cell_ids, n_cells, target, device,
 # --------------------------------------------------------------------------- #
 def verify(model, x, cell_ids, n_cells, target, class_name, device,
            ref_specs, const_specs, N, beta_min, K=1, c_lambda=0.30,
-           c_est=1.0, n_pilot=512, sigma_obs=0.0, var_thresh=1e-4,
+           c_est=1.0, n_pilot=512, sigma_obs=0.0, r2_thresh=0.95,
            ood_thresh=5.0, seed=0, batch_size=64, out=None):
     d = n_cells
     C_composite = c_est * c_lambda
@@ -410,7 +445,8 @@ def verify(model, x, cell_ids, n_cells, target, class_name, device,
             c_lambda, sigma_obs=sigma_obs, seed=seed, batch_size=batch_size)
         passed, ainfo = admissibility_check(
             model, x, b, cell_ids, n_cells, target, device,
-            pinfo["y_pilot"], var_thresh, ood_thresh, batch_size)
+            pinfo["y_pilot"], pinfo["Z_pilot"], r2_thresh, ood_thresh,
+            batch_size)
 
         run = run_reference_at_N(
             model, x, b, cell_ids, n_cells, target, device, sigma_eff, d, N,
@@ -419,10 +455,11 @@ def verify(model, x, cell_ids, n_cells, target, class_name, device,
 
         row = {
             "spec": spec, "sigma_eff": sigma_eff,
-            "m_hat": pinfo["m_hat"], "re_proxy": pinfo["re_proxy"],
-            "score_var": ainfo["score_var"], "ood": ainfo["ood_dist"],
+            "m_hat": pinfo["m_hat"], "re_proxy": run["re_proxy"],
+            "score_var": ainfo["score_var"],
+            "global_shift_r2": ainfo["global_shift_r2"], "ood": ainfo["ood_dist"],
             "fill_range": (ainfo["fill_min"], ainfo["fill_max"]),
-            "pass_var": ainfo["pass_var"], "pass_range": ainfo["pass_range"],
+            "pass_struct": ainfo["pass_struct"], "pass_range": ainfo["pass_range"],
             "pass_ood": ainfo["pass_ood"], "admissible": passed,
             "floor_realized": run["floor_realized"],
             "cert_count": run["cert_count"], "vacuous": run["vacuous"],
@@ -438,21 +475,24 @@ def verify(model, x, cell_ids, n_cells, target, class_name, device,
     # ---- per-reference table (admissible) ------------------------------- #
     print("[Admissible references] (gated by Appendix I before entering the law)")
     print(f"  {'ref':>10} {'sigma_eff':>9} {'m_hat':>8} {'RE_min':>7} "
-          f"{'floor(N)':>9} {'#cert':>6} {'score_var':>9} {'ood':>6}")
+          f"{'floor(N)':>9} {'#cert':>6} {'gshift_r2':>9} {'ood':>6}")
     for r in admissible_rows:
         print(f"  {r['spec']:>10} {r['sigma_eff']:>9.5f} {r['m_hat']:>8.5f} "
               f"{r['re_proxy']:>7.3f} {r['floor_realized']:>9.5f} "
-              f"{r['cert_count']:>6} {r['score_var']:>9.5f} {r['ood']:>6.2f}"
+              f"{r['cert_count']:>6} {r['global_shift_r2']:>9.4f} "
+              f"{r['ood']:>6.2f}"
               f"{'  [VACUOUS]' if r['vacuous'] else ''}")
     print()
 
     if rejected_rows:
         print("[REJECTED by admissibility gate] -- excluded from the cost law")
-        print("  (low score_var => flattening reference; or out-of-range / OOD)")
+        print("  (global_shift_r2 ~ 1 => flattening ref: response is just the")
+        print("   global mask fraction, no per-cell structure; or range / OOD)")
         for r in rejected_rows:
             why = []
-            if not r["pass_var"]:
-                why.append(f"degenerate (score_var={r['score_var']:.2e})")
+            if not r["pass_struct"]:
+                why.append(
+                    f"degenerate (global_shift_r2={r['global_shift_r2']:.4f})")
             if not r["pass_range"]:
                 why.append(f"out-of-range {r['fill_range']}")
             if not r["pass_ood"]:
@@ -463,10 +503,11 @@ def verify(model, x, cell_ids, n_cells, target, class_name, device,
     if const_rows:
         print("[Constant fills] -- reported SEPARATELY (edge of R_adm), NOT in law")
         print(f"  {'ref':>10} {'sigma_eff':>9} {'m_hat':>8} {'floor(N)':>9} "
-              f"{'#cert':>6} {'admissible?':>11}")
+              f"{'#cert':>6} {'gshift_r2':>9} {'admissible?':>11}")
         for r in const_rows:
             print(f"  {r['spec']:>10} {r['sigma_eff']:>9.5f} {r['m_hat']:>8.5f} "
                   f"{r['floor_realized']:>9.5f} {r['cert_count']:>6} "
+                  f"{r['global_shift_r2']:>9.4f} "
                   f"{'yes' if r['admissible'] else 'no':>11}")
         print()
 
@@ -642,9 +683,11 @@ def main():
     ap.add_argument("--n-pilot", type=int, default=512)
     ap.add_argument("--sigma-obs", type=float, default=0.0,
                     help="query-noise scale (0 for deterministic model+ref)")
-    ap.add_argument("--var-thresh", type=float, default=1e-4,
-                    help="min target-score variance over pilot masks for a "
-                         "reference to count as non-degenerate (Appendix I)")
+    ap.add_argument("--r2-thresh", type=float, default=0.95,
+                    help="max global-shift R^2 for a reference to count as "
+                         "non-degenerate (Appendix I): if g_rho is explained by "
+                         "the global mask fraction alone above this, it carries "
+                         "no resolvable per-cell structure and is rejected")
     ap.add_argument("--ood-thresh", type=float, default=5.0,
                     help="max relative penultimate-feature distance of the "
                          "all-off composite to the original (OOD gate)")
@@ -670,7 +713,7 @@ def main():
            ref_specs=args.refs, const_specs=args.const_refs, N=args.N,
            beta_min=args.beta_min, K=args.K, c_lambda=args.c_lambda,
            c_est=args.c_est, n_pilot=args.n_pilot, sigma_obs=args.sigma_obs,
-           var_thresh=args.var_thresh, ood_thresh=args.ood_thresh,
+           r2_thresh=args.r2_thresh, ood_thresh=args.ood_thresh,
            seed=args.seed, batch_size=args.batch_size, out=args.out)
 
 
