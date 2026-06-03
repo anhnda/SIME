@@ -16,6 +16,14 @@ Pipeline (matches the verified support-recovery theory):
 Per-cell main effects paint a blocky 2D map (as in LIME). Pairwise
 interactions cannot be a pixel value, so they are returned in
 extras["interactions"] as (cell_i, cell_j, strength) triples.
+
+NOTE on standardization: the +/-0.5 main columns have std ~0.5 while the
+product (pair) columns have std ~0.25. A single Lasso lambda cannot be correct
+for both blocks at once -- the small-variance pair columns get over-penalized
+and die. We therefore standardize all design columns to unit norm before Lasso
+(the theory's RE/incoherence conditions assume normalized design), run
+selection on the standardized design, then de-bias by refitting on the RAW
+columns in Stage 3 so reported Delta values stay in probability units.
 """
 from __future__ import annotations
 
@@ -36,15 +44,15 @@ class SIMEExplainer(Explainer):
                  kernel_width=0.25, seed=0, batch_size=64,
                  screen_quantile=0.6, max_active_cells=40,
                  stability_runs=20, stability_thresh=0.6,
-                 lasso_C=2.0, leak_c=1.0, **kw):
+                 lasso_C=1.0, leak_c=1.0, **kw):
         """
-        lasso_C  : constant C in lambda = C (sigma + c sqrt(m)) sqrt(log p / N).
-                   Paper's verified support-recovery transition is C in [2,3]; 2.0
-                   is the conservative recoverable point. (Replaces the old
-                   lasso_lambda_scale=0.3, which sat ~10x below the validated floor.)
-        leak_c   : constant c on the reference-leakage term sqrt(m_hat). c=1 uses the
-                   held-out residual energy directly; raise to be more conservative
-                   against off-manifold references.
+        lasso_C  : constant C in lambda = C (sigma + c sqrt(m)) sqrt(log p / N),
+                   applied to a UNIT-NORM standardized design. Paper's verified
+                   support-recovery transition is C in [2,3] for the raw scale;
+                   on the standardized design C ~ 1.0 is the matching point.
+        leak_c   : constant c on the reference-leakage term sqrt(m_hat). c=1 uses
+                   the held-out residual energy directly; raise to be more
+                   conservative against off-manifold references.
         """
         super().__init__(*args, **kw)
         self.grid = grid
@@ -123,14 +131,20 @@ class SIMEExplainer(Explainer):
         p_dim = X.shape[1]
         y = probs - probs.mean()
 
+        # standardize columns to unit norm so a single lambda is correct for both
+        # the mains block (std ~0.5) and the pairs block (std ~0.25).
+        col_scale = X.std(axis=0)
+        col_scale[col_scale < 1e-12] = 1.0
+        Xn = X / col_scale
+
         sigma_hat = max(np.std(y), 1e-6)
 
         # --- Reference-SNR penalty (Theorem 1): lambda = C (sigma + c sqrt(m)) sqrt(log p / N)
         #     m_hat = held-out higher-order residual energy (Algorithm 1 proxy),
-        #     which is the reference-induced misspecification term. Estimated WITHOUT
-        #     recovering any degree->2 coefficient: it is just the unexplained variance
-        #     of the degree-2 fit on a fresh split.
-        m_hat = self._residual_energy_proxy(X, y, sigma_hat)
+        #     the reference-induced misspecification term. Estimated WITHOUT
+        #     recovering any degree-2 coefficient: unexplained variance of the
+        #     degree-2 fit on a fresh split. Computed on the standardized design.
+        m_hat = self._residual_energy_proxy(Xn, y, sigma_hat)
         lam = (self.lasso_C * (sigma_hat + self.leak_c * np.sqrt(m_hat))
                * np.sqrt(np.log(p_dim) / self.n_samples))
 
@@ -140,7 +154,7 @@ class SIMEExplainer(Explainer):
             for _ in range(self.stability_runs):
                 idx = rng.choice(self.n_samples, self.n_samples, replace=True)
                 mm = LassoLars(alpha=lmbda, fit_intercept=True, max_iter=4000)
-                mm.fit(X[idx], y[idx])
+                mm.fit(Xn[idx], y[idx])
                 sc += (np.abs(mm.coef_) > 0).astype(float)
             return sc / self.stability_runs
 
@@ -153,17 +167,19 @@ class SIMEExplainer(Explainer):
         # or choose a lower-m reference). Relaxing lambda voids the recovery guarantee.
 
         # single-fit count + below-threshold candidates, reported as DIAGNOSTICS only.
-        full = LassoLars(alpha=lam, fit_intercept=True, max_iter=4000).fit(X, y)
+        full = LassoLars(alpha=lam, fit_intercept=True, max_iter=4000).fit(Xn, y)
         n_full = int(np.sum(np.abs(full.coef_[m_act:]) > 0))
-        # candidates that the single fit picks but stability does NOT confirm:
         below = []
         for gi in range(m_act, p_dim):
             if full.coef_[gi] != 0.0 and not selected[gi]:
                 ci, cj = pair_list[gi - m_act]
-                below.append((int(ci), int(cj), float(full.coef_[gi]), float(stab[gi])))
+                # report coef back on raw scale for interpretability
+                below.append((int(ci), int(cj),
+                              float(full.coef_[gi] / col_scale[gi]),
+                              float(stab[gi])))
         below.sort(key=lambda t: -abs(t[2]))
 
-        floor = lam  # detection floor ~ lambda, for reporting
+        floor = lam  # detection floor ~ lambda (standardized scale), for reporting
         print(f"[sime] sigma(y)={sigma_hat:.4f} m_hat={m_hat:.5f} "
               f"leak_frac={self.leak_c*np.sqrt(m_hat)/(sigma_hat+1e-12):.2f} "
               f"lam={lam:.5f} single-fit pairs={n_full} stable pairs={n_pairs}")
@@ -173,10 +189,10 @@ class SIMEExplainer(Explainer):
                   f"{lam:.5f}. Raise n_samples or use a lower-m reference (blur/"
                   "inpaint) to lower the floor. (Did NOT relax lambda.)")
 
-        # ---------- STAGE 3: re-solve on selected support ----------
+        # ---------- STAGE 3: re-solve on selected support (RAW columns) ----------
         sel_idx = np.where(selected)[0]
         if sel_idx.size:
-            Xs = X[:, sel_idx]
+            Xs = X[:, sel_idx]                 # raw, unscaled -> Delta in prob units
             beta = _weighted_ridge(Xs, y, weights, alpha=1.0)
         else:
             beta = np.zeros(0)
@@ -227,6 +243,7 @@ class SIMEExplainer(Explainer):
     # higher-order coefficient -- it is unexplained variance of the
     # degree-2 fit measured on a fresh split. Upward bias (finite-sample
     # error in g_hat) is the conservative direction for a detection floor.
+    # Operates on the standardized design Xn passed in by explain().
     # ------------------------------------------------------------------ #
     def _residual_energy_proxy(self, X, y, sigma_hat):
         n = X.shape[0]
@@ -234,7 +251,6 @@ class SIMEExplainer(Explainer):
         perm = rng.permutation(n)
         n_tr = n // 2
         tr, va = perm[:n_tr], perm[n_tr:]
-        # ridge fit of the degree-2 surrogate on train (light reg for conditioning)
         Xtr = np.concatenate([X[tr], np.ones((tr.size, 1))], axis=1)
         A = Xtr.T @ Xtr + 1e-3 * np.eye(Xtr.shape[1])
         A[-1, -1] = 0.0
