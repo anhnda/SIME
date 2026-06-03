@@ -114,24 +114,25 @@ def centered_design(Z):
 
 
 def standardized_lasso_fit(Z, y, lam, n_iter=20000, tol=1e-7):
-    """Column-standardized Lasso; returns coefficients in ORIGINAL design scale.
+    """K=1 Lasso on the centered +-1 design; coefficients in the chi_S basis.
 
-    Standardize columns to unit empirical norm (Appendix A), fit, then unscale
-    so coefficients are comparable to the floor in the natural chi_S basis.
+    The centered +-1 design already has equal column norms (||X_j|| = sqrt(N)
+    exactly, since entries are +-1), so column standardization is a no-op up to
+    the global sqrt(N) factor. That factor belongs in the penalty (sklearn's
+    objective is 1/(2N)||y-Xb||^2 + alpha||b||_1, which already carries the 1/N),
+    NOT divided out of beta. Dividing beta by col_norm ~ sqrt(N) was the bug that
+    crushed every coefficient by ~2 orders of magnitude. We fit directly and
+    return coefficients on the same natural scale as floor(N, rho).
     """
     X = centered_design(Z)
-    col_norm = np.sqrt((X ** 2).sum(axis=0)) + 1e-12
-    Xs = X / col_norm
     try:
         from sklearn.linear_model import Lasso
         m = Lasso(alpha=max(lam, 1e-9), fit_intercept=True,
                   max_iter=n_iter, tol=tol)
-        m.fit(Xs, y)
-        beta_s = m.coef_.copy()
+        m.fit(X, y)
+        return m.coef_.copy()
     except Exception:
-        beta_s = _lasso_cd(Xs, y, lam, n_iter, tol)
-    # unscale: beta_orig_j = beta_std_j / col_norm_j (since Xs_j = X_j/col_norm_j)
-    return beta_s / col_norm
+        return _lasso_cd(X, y, lam, n_iter, tol)
 
 
 def _lasso_cd(X, y, lam, n_iter=20000, tol=1e-7):
@@ -235,6 +236,20 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
         floor = floors[k]
         cert_indicator[k] = np.abs(beta_hat) > floor
 
+    # diagnostic: coefficient magnitudes vs floor at the largest budget.
+    # A healthy run has max|beta| well above the floor; if max|beta| < floor at
+    # every N, certification is vacuous and the "PASS" below is meaningless.
+    max_abs_final = float(np.max(np.abs(beta_hist[-1])))
+    print(f"  diag: max|beta_hat| at N={grid[-1]} = {max_abs_final:.5f}  "
+          f"vs floor = {floors[-1]:.5f}  "
+          f"(ratio {max_abs_final / (floors[-1] + 1e-12):.1f}x)")
+    if max_abs_final < floors[-1]:
+        print("  WARNING: no coefficient clears the floor at ANY budget -- the "
+              "certified set is empty and the PASS results are VACUOUS. Check "
+              "the fit scale / sigma_eff / c_lambda before trusting this.\n")
+    else:
+        print()
+
     # ---- Claim 1: floor non-increasing ----------------------------------- #
     floor_arr = np.array(floors)
     floor_mono = bool(np.all(np.diff(floor_arr) <= 1e-12))
@@ -306,9 +321,12 @@ def verify(model, x, b, cell_ids, n_cells, target, class_name, device,
     print(f"  no sign flips                  : "
           f"{'PASS' if sign_ok else 'CHECK'}\n")
 
-    overall = floor_mono and set_mono and flicker_rate <= 0.10 and sign_ok
+    non_vacuous = max_abs_final >= floors[-1] and n_entered > 0
+    overall = (floor_mono and set_mono and flicker_rate <= 0.10
+               and sign_ok and non_vacuous)
     print("=" * 76)
-    print(f"  OVERALL 5.2(A)                : {'PASS' if overall else 'CHECK'}")
+    status = "PASS" if overall else ("VACUOUS" if not non_vacuous else "CHECK")
+    print(f"  OVERALL 5.2(A)                : {status}")
     print("=" * 76)
 
     if out:
